@@ -32,6 +32,8 @@
 
 #include <univalue.h>
 
+using node::NodeContext;
+
 const std::vector<std::string> CONNECTION_TYPE_DOC{
         "outbound-full-relay (default automatic connections)",
         "block-relay-only (does not relay transactions or addresses)",
@@ -646,7 +648,7 @@ static RPCHelpMan getnetworkinfo()
     obj.pushKV("incrementalfee", ValueFromAmount(::incrementalRelayFee.GetFeePerK()));
     UniValue localAddresses(UniValue::VARR);
     {
-        LOCK(cs_mapLocalHost);
+        LOCK(g_maplocalhost_mutex);
         for (const std::pair<const CNetAddr, LocalServiceInfo> &item : mapLocalHost)
         {
             UniValue rec(UniValue::VOBJ);

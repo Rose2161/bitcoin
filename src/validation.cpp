@@ -62,6 +62,25 @@
 
 #include <boost/algorithm/string/replace.hpp>
 
+using node::BLOCKFILE_CHUNK_SIZE;
+using node::BlockManager;
+using node::BlockMap;
+using node::CBlockIndexWorkComparator;
+using node::CCoinsStats;
+using node::CoinStatsHashType;
+using node::GetUTXOStats;
+using node::OpenBlockFile;
+using node::ReadBlockFromDisk;
+using node::SnapshotMetadata;
+using node::UNDOFILE_CHUNK_SIZE;
+using node::UndoReadFromDisk;
+using node::UnlinkPrunedFiles;
+using node::fHavePruned;
+using node::fImporting;
+using node::fPruneMode;
+using node::fReindex;
+using node::nPruneTarget;
+
 #define MICRO 0.000001
 #define MILLI 0.001
 
@@ -328,43 +347,59 @@ void CChainState::MaybeUpdateMempoolForReorg(
     // previously-confirmed transactions back to the mempool.
     // UpdateTransactionsFromBlock finds descendants of any transactions in
     // the disconnectpool that were added back and cleans up the mempool state.
-    m_mempool->UpdateTransactionsFromBlock(vHashUpdate);
+    const uint64_t ancestor_count_limit = gArgs.GetIntArg("-limitancestorcount", DEFAULT_ANCESTOR_LIMIT);
+    const uint64_t ancestor_size_limit = gArgs.GetIntArg("-limitancestorsize", DEFAULT_ANCESTOR_SIZE_LIMIT) * 1000;
+    m_mempool->UpdateTransactionsFromBlock(vHashUpdate, ancestor_size_limit, ancestor_count_limit);
 
-    const auto check_final_and_mature = [this, flags=STANDARD_LOCKTIME_VERIFY_FLAGS](CTxMemPool::txiter it)
+    // Predicate to use for filtering transactions in removeForReorg.
+    // Checks whether the transaction is still final and, if it spends a coinbase output, mature.
+    // Also updates valid entries' cached LockPoints if needed.
+    // If false, the tx is still valid and its lockpoints are updated.
+    // If true, the tx would be invalid in the next block; remove this entry and all of its descendants.
+    const auto filter_final_and_mature = [this, flags=STANDARD_LOCKTIME_VERIFY_FLAGS](CTxMemPool::txiter it)
         EXCLUSIVE_LOCKS_REQUIRED(m_mempool->cs, ::cs_main) {
-        bool should_remove = false;
         AssertLockHeld(m_mempool->cs);
         AssertLockHeld(::cs_main);
         const CTransaction& tx = it->GetTx();
+
+        // The transaction must be final.
+        if (!CheckFinalTx(m_chain.Tip(), tx, flags)) return true;
         LockPoints lp = it->GetLockPoints();
         const bool validLP{TestLockPointValidity(m_chain, lp)};
         CCoinsViewMemPool view_mempool(&CoinsTip(), *m_mempool);
-        if (!CheckFinalTx(m_chain.Tip(), tx, flags)
-            || !CheckSequenceLocks(m_chain.Tip(), view_mempool, tx, flags, &lp, validLP)) {
-            // Note if CheckSequenceLocks fails the LockPoints may still be invalid
-            // So it's critical that we remove the tx and not depend on the LockPoints.
-            should_remove = true;
-        } else if (it->GetSpendsCoinbase()) {
+        // CheckSequenceLocks checks if the transaction will be final in the next block to be
+        // created on top of the new chain. We use useExistingLockPoints=false so that, instead of
+        // using the information in lp (which might now refer to a block that no longer exists in
+        // the chain), it will update lp to contain LockPoints relevant to the new chain.
+        if (!CheckSequenceLocks(m_chain.Tip(), view_mempool, tx, flags, &lp, validLP)) {
+            // If CheckSequenceLocks fails, remove the tx and don't depend on the LockPoints.
+            return true;
+        } else if (!validLP) {
+            // If CheckSequenceLocks succeeded, it also updated the LockPoints.
+            // Now update the mempool entry lockpoints as well.
+            m_mempool->mapTx.modify(it, [&lp](CTxMemPoolEntry& e) { e.UpdateLockPoints(lp); });
+        }
+
+        // If the transaction spends any coinbase outputs, it must be mature.
+        if (it->GetSpendsCoinbase()) {
             for (const CTxIn& txin : tx.vin) {
                 auto it2 = m_mempool->mapTx.find(txin.prevout.hash);
                 if (it2 != m_mempool->mapTx.end())
                     continue;
-                const Coin &coin = CoinsTip().AccessCoin(txin.prevout);
+                const Coin& coin{CoinsTip().AccessCoin(txin.prevout)};
                 assert(!coin.IsSpent());
                 const auto mempool_spend_height{m_chain.Tip()->nHeight + 1};
-                if (coin.IsSpent() || (coin.IsCoinBase() && mempool_spend_height - coin.nHeight < COINBASE_MATURITY)) {
-                    should_remove = true;
-                    break;
+                if (coin.IsCoinBase() && mempool_spend_height - coin.nHeight < COINBASE_MATURITY) {
+                    return true;
                 }
             }
         }
-        // CheckSequenceLocks updates lp. Update the mempool entry LockPoints.
-        if (!validLP) m_mempool->mapTx.modify(it, update_lock_points(lp));
-        return should_remove;
+        // Transaction is still valid and cached LockPoints are updated.
+        return false;
     };
 
     // We also need to remove any now-immature transactions
-    m_mempool->removeForReorg(m_chain, check_final_and_mature);
+    m_mempool->removeForReorg(m_chain, filter_final_and_mature);
     // Re-limit mempool size, in case we added any transactions
     LimitMempoolSize(
         *m_mempool,
@@ -586,10 +621,10 @@ private:
 
     // Submit all transactions to the mempool and call ConsensusScriptChecks to add to the script
     // cache - should only be called after successful validation of all transactions in the package.
-    // The package may end up partially-submitted after size limitting; returns true if all
+    // The package may end up partially-submitted after size limiting; returns true if all
     // transactions are successfully added to the mempool, false otherwise.
-    bool FinalizePackage(const ATMPArgs& args, std::vector<Workspace>& workspaces, PackageValidationState& package_state,
-                         std::map<const uint256, const MempoolAcceptResult>& results)
+    bool SubmitPackage(const ATMPArgs& args, std::vector<Workspace>& workspaces, PackageValidationState& package_state,
+                       std::map<const uint256, const MempoolAcceptResult>& results)
          EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
 
     // Compare a package's feerate against minimum allowed.
@@ -1028,12 +1063,17 @@ bool MemPoolAccept::Finalize(const ATMPArgs& args, Workspace& ws)
     return true;
 }
 
-bool MemPoolAccept::FinalizePackage(const ATMPArgs& args, std::vector<Workspace>& workspaces,
-                                    PackageValidationState& package_state,
-                                    std::map<const uint256, const MempoolAcceptResult>& results)
+bool MemPoolAccept::SubmitPackage(const ATMPArgs& args, std::vector<Workspace>& workspaces,
+                                  PackageValidationState& package_state,
+                                  std::map<const uint256, const MempoolAcceptResult>& results)
 {
     AssertLockHeld(cs_main);
     AssertLockHeld(m_pool.cs);
+    // Sanity check: none of the transactions should be in the mempool, and none of the transactions
+    // should have a same-txid-different-witness equivalent in the mempool.
+    assert(std::all_of(workspaces.cbegin(), workspaces.cend(), [this](const auto& ws){
+        return !m_pool.exists(GenTxid::Txid(ws.m_ptx->GetHash())); }));
+
     bool all_submitted = true;
     // ConsensusScriptChecks adds to the script cache and is therefore consensus-critical;
     // CheckInputsFromMempoolAndCache asserts that transactions only spend coins available from the
@@ -1043,18 +1083,24 @@ bool MemPoolAccept::FinalizePackage(const ATMPArgs& args, std::vector<Workspace>
         if (!ConsensusScriptChecks(args, ws)) {
             results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
             // Since PolicyScriptChecks() passed, this should never fail.
-            all_submitted = Assume(false);
+            all_submitted = false;
+            package_state.Invalid(PackageValidationResult::PCKG_MEMPOOL_ERROR,
+                                  strprintf("BUG! PolicyScriptChecks succeeded but ConsensusScriptChecks failed: %s",
+                                            ws.m_ptx->GetHash().ToString()));
         }
 
         // Re-calculate mempool ancestors to call addUnchecked(). They may have changed since the
         // last calculation done in PreChecks, since package ancestors have already been submitted.
-        std::string err_string;
+        std::string unused_err_string;
         if(!m_pool.CalculateMemPoolAncestors(*ws.m_entry, ws.m_ancestors, m_limit_ancestors,
                                              m_limit_ancestor_size, m_limit_descendants,
-                                             m_limit_descendant_size, err_string)) {
+                                             m_limit_descendant_size, unused_err_string)) {
             results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
             // Since PreChecks() and PackageMempoolChecks() both enforce limits, this should never fail.
-            all_submitted = Assume(false);
+            all_submitted = false;
+            package_state.Invalid(PackageValidationResult::PCKG_MEMPOOL_ERROR,
+                                  strprintf("BUG! Mempool ancestors or descendants were underestimated: %s",
+                                            ws.m_ptx->GetHash().ToString()));
         }
         // If we call LimitMempoolSize() for each individual Finalize(), the mempool will not take
         // the transaction's descendant feerate into account because it hasn't seen them yet. Also,
@@ -1064,7 +1110,9 @@ bool MemPoolAccept::FinalizePackage(const ATMPArgs& args, std::vector<Workspace>
         if (!Finalize(args, ws)) {
             results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
             // Since LimitMempoolSize() won't be called, this should never fail.
-            all_submitted = Assume(false);
+            all_submitted = false;
+            package_state.Invalid(PackageValidationResult::PCKG_MEMPOOL_ERROR,
+                                  strprintf("BUG! Adding to mempool failed: %s", ws.m_ptx->GetHash().ToString()));
         }
     }
 
@@ -1073,7 +1121,6 @@ bool MemPoolAccept::FinalizePackage(const ATMPArgs& args, std::vector<Workspace>
     LimitMempoolSize(m_pool, m_active_chainstate.CoinsTip(),
                      gArgs.GetIntArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000,
                      std::chrono::hours{gArgs.GetIntArg("-mempoolexpiry", DEFAULT_MEMPOOL_EXPIRY)});
-    if (!all_submitted) return false;
 
     // Find the wtxids of the transactions that made it into the mempool. Allow partial submission,
     // but don't report success unless they all made it into the mempool.
@@ -1178,8 +1225,8 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
 
     if (args.m_test_accept) return PackageMempoolAcceptResult(package_state, std::move(results));
 
-    if (!FinalizePackage(args, workspaces, package_state, results)) {
-        package_state.Invalid(PackageValidationResult::PCKG_TX, "submission failed");
+    if (!SubmitPackage(args, workspaces, package_state, results)) {
+        // PackageValidationState filled in by SubmitPackage().
         return PackageMempoolAcceptResult(package_state, std::move(results));
     }
 
@@ -1204,11 +1251,13 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, 
         return PackageMempoolAcceptResult(package_state, {});
     }
 
-    const auto& child = package[package.size() - 1];
+    // IsChildWithParents() guarantees the package is > 1 transactions.
+    assert(package.size() > 1);
     // The package must be 1 child with all of its unconfirmed parents. The package is expected to
     // be sorted, so the last transaction is the child.
+    const auto& child = package.back();
     std::unordered_set<uint256, SaltedTxidHasher> unconfirmed_parent_txids;
-    std::transform(package.cbegin(), package.end() - 1,
+    std::transform(package.cbegin(), package.cend() - 1,
                    std::inserter(unconfirmed_parent_txids, unconfirmed_parent_txids.end()),
                    [](const auto& tx) { return tx->GetHash(); });
 
@@ -1240,10 +1289,14 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, 
 
     LOCK(m_pool.cs);
     std::map<const uint256, const MempoolAcceptResult> results;
-    // As node operators are free to set their mempool policies however they please, it's possible
-    // for package transaction(s) to already be in the mempool, and we don't want to reject the
-    // entire package in that case (as that could be a censorship vector).  Filter the transactions
-    // that are already in mempool and add their information to results, since we already have them.
+    // Node operators are free to set their mempool policies however they please, nodes may receive
+    // transactions in different orders, and malicious counterparties may try to take advantage of
+    // policy differences to pin or delay propagation of transactions. As such, it's possible for
+    // some package transaction(s) to already be in the mempool, and we don't want to reject the
+    // entire package in that case (as that could be a censorship vector). De-duplicate the
+    // transactions that are already in the mempool, and only call AcceptMultipleTransactions() with
+    // the new transactions. This ensures we don't double-count transaction counts and sizes when
+    // checking ancestor/descendant limits, or double-count transaction fees for fee-related policy.
     std::vector<CTransactionRef> txns_new;
     for (const auto& tx : package) {
         const auto& wtxid = tx->GetWitnessHash();
@@ -1264,9 +1317,10 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, 
             // transaction for the mempool one. Note that we are ignoring the validity of the
             // package transaction passed in.
             // TODO: allow witness replacement in packages.
-            auto iter = m_pool.GetIter(wtxid);
+            auto iter = m_pool.GetIter(txid);
             assert(iter != std::nullopt);
-            results.emplace(txid, MempoolAcceptResult::MempoolTx(iter.value()->GetTxSize(), iter.value()->GetFee()));
+            // Provide the wtxid of the mempool tx so that the caller can look it up in the mempool.
+            results.emplace(wtxid, MempoolAcceptResult::MempoolTxDifferentWitness(iter.value()->GetTx().GetWitnessHash()));
         } else {
             // Transaction does not already exist in the mempool.
             txns_new.push_back(tx);
@@ -1333,12 +1387,12 @@ PackageMempoolAcceptResult ProcessNewPackage(CChainState& active_chainstate, CTx
     }();
 
     // Uncache coins pertaining to transactions that were not submitted to the mempool.
-    // Ensure the coins cache is still within limits.
     if (test_accept || result.m_state.IsInvalid()) {
         for (const COutPoint& hashTx : coins_to_uncache) {
             active_chainstate.CoinsTip().Uncache(hashTx);
         }
     }
+    // Ensure the coins cache is still within limits.
     BlockValidationState state_dummy;
     active_chainstate.FlushStateToDisk(state_dummy, FlushStateMode::PERIODIC);
     return result;
@@ -3509,7 +3563,10 @@ bool ChainstateManager::ProcessNewBlockHeaders(const std::vector<CBlockHeader>& 
     }
     if (NotifyHeaderTip(ActiveChainstate())) {
         if (ActiveChainstate().IsInitialBlockDownload() && ppindex && *ppindex) {
-            LogPrintf("Synchronizing blockheaders, height: %d (~%.2f%%)\n", (*ppindex)->nHeight, 100.0/((*ppindex)->nHeight+(GetAdjustedTime() - (*ppindex)->GetBlockTime()) / Params().GetConsensus().nPowTargetSpacing) * (*ppindex)->nHeight);
+            const CBlockIndex& last_accepted{**ppindex};
+            const int64_t blocks_left{(GetTime() - last_accepted.GetBlockTime()) / chainparams.GetConsensus().nPowTargetSpacing};
+            const double progress{100.0 * last_accepted.nHeight / (last_accepted.nHeight + blocks_left)};
+            LogPrintf("Synchronizing blockheaders, height: %d (~%.2f%%)\n", last_accepted.nHeight, progress);
         }
     }
     return true;
@@ -4854,7 +4911,7 @@ bool ChainstateManager::PopulateAndValidateSnapshot(
     // about the snapshot_chainstate.
     CCoinsViewDB* snapshot_coinsdb = WITH_LOCK(::cs_main, return &snapshot_chainstate.CoinsDB());
 
-    if (!GetUTXOStats(snapshot_coinsdb, WITH_LOCK(::cs_main, return std::ref(m_blockman)), stats, breakpoint_fnc)) {
+    if (!GetUTXOStats(snapshot_coinsdb, m_blockman, stats, breakpoint_fnc)) {
         LogPrintf("[snapshot] failed to generate coins stats\n");
         return false;
     }

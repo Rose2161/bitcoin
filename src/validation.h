@@ -43,12 +43,14 @@ class CBlockTreeDB;
 class CChainParams;
 class CTxMemPool;
 class ChainstateManager;
-class SnapshotMetadata;
 struct ChainTxData;
 struct DisconnectedBlockTransactions;
 struct PrecomputedTransactionData;
 struct LockPoints;
 struct AssumeutxoData;
+namespace node {
+class SnapshotMetadata;
+} // namespace node
 
 /** Default for -minrelaytxfee, minimum relay fee for transactions */
 static const unsigned int DEFAULT_MIN_RELAY_TX_FEE = 1000;
@@ -161,8 +163,12 @@ struct MempoolAcceptResult {
         VALID, //!> Fully validated, valid.
         INVALID, //!> Invalid.
         MEMPOOL_ENTRY, //!> Valid, transaction was already in the mempool.
+        DIFFERENT_WITNESS, //!> Not validated. A same-txid-different-witness tx (see m_other_wtxid) already exists in the mempool and was not replaced.
     };
+    /** Result type. Present in all MempoolAcceptResults. */
     const ResultType m_result_type;
+
+    /** Contains information about why the transaction failed. */
     const TxValidationState m_state;
 
     // The following fields are only present when m_result_type = ResultType::VALID or MEMPOOL_ENTRY
@@ -172,6 +178,10 @@ struct MempoolAcceptResult {
     const std::optional<int64_t> m_vsize;
     /** Raw base fees in satoshis. */
     const std::optional<CAmount> m_base_fees;
+
+    // The following field is only present when m_result_type = ResultType::DIFFERENT_WITNESS
+    /** The wtxid of the transaction in the mempool which has the same txid but different witness. */
+    const std::optional<uint256> m_other_wtxid;
 
     static MempoolAcceptResult Failure(TxValidationState state) {
         return MempoolAcceptResult(state);
@@ -183,6 +193,10 @@ struct MempoolAcceptResult {
 
     static MempoolAcceptResult MempoolTx(int64_t vsize, CAmount fees) {
         return MempoolAcceptResult(vsize, fees);
+    }
+
+    static MempoolAcceptResult MempoolTxDifferentWitness(const uint256& other_wtxid) {
+        return MempoolAcceptResult(other_wtxid);
     }
 
 // Private constructors. Use static methods MempoolAcceptResult::Success, etc. to construct.
@@ -201,6 +215,10 @@ private:
     /** Constructor for already-in-mempool case. It wouldn't replace any transactions. */
     explicit MempoolAcceptResult(int64_t vsize, CAmount fees)
         : m_result_type(ResultType::MEMPOOL_ENTRY), m_vsize{vsize}, m_base_fees(fees) {}
+
+    /** Constructor for witness-swapped case. */
+    explicit MempoolAcceptResult(const uint256& other_wtxid)
+        : m_result_type(ResultType::DIFFERENT_WITNESS), m_other_wtxid(other_wtxid) {}
 };
 
 /**
@@ -210,7 +228,7 @@ struct PackageMempoolAcceptResult
 {
     const PackageValidationState m_state;
     /**
-    * Map from (w)txid to finished MempoolAcceptResults. The client is responsible
+    * Map from wtxid to finished MempoolAcceptResults. The client is responsible
     * for keeping track of the transaction objects themselves. If a result is not
     * present, it means validation was unfinished for that transaction. If there
     * was a package-wide error (see result in m_state), m_tx_results will be empty.
@@ -476,7 +494,7 @@ protected:
 public:
     //! Reference to a BlockManager instance which itself is shared across all
     //! CChainState instances.
-    BlockManager& m_blockman;
+    node::BlockManager& m_blockman;
 
     /** Chain parameters for this chainstate */
     const CChainParams& m_params;
@@ -488,7 +506,7 @@ public:
 
     explicit CChainState(
         CTxMemPool* mempool,
-        BlockManager& blockman,
+        node::BlockManager& blockman,
         ChainstateManager& chainman,
         std::optional<uint256> from_snapshot_blockhash = std::nullopt);
 
@@ -535,7 +553,7 @@ public:
      * chainstates) and as good as our current tip or better. Entries may be failed,
      * though, and pruning nodes may be missing the data for the block.
      */
-    std::set<CBlockIndex*, CBlockIndexWorkComparator> setBlockIndexCandidates;
+    std::set<CBlockIndex*, node::CBlockIndexWorkComparator> setBlockIndexCandidates;
 
     //! @returns A reference to the in-memory cache of the UTXO set.
     CCoinsViewCache& CoinsTip() EXCLUSIVE_LOCKS_REQUIRED(cs_main)
@@ -803,13 +821,13 @@ private:
     bool m_snapshot_validated{false};
 
     CBlockIndex* m_best_invalid;
-    friend bool BlockManager::LoadBlockIndex(const Consensus::Params&, ChainstateManager&);
+    friend bool node::BlockManager::LoadBlockIndex(const Consensus::Params&, ChainstateManager&);
 
     //! Internal helper for ActivateSnapshot().
     [[nodiscard]] bool PopulateAndValidateSnapshot(
         CChainState& snapshot_chainstate,
         CAutoFile& coins_file,
-        const SnapshotMetadata& metadata);
+        const node::SnapshotMetadata& metadata);
 
     /**
      * If a block header hasn't already been seen, call CheckBlockHeader on it, ensure
@@ -826,7 +844,7 @@ public:
     std::thread m_load_block;
     //! A single BlockManager instance is shared across each constructed
     //! chainstate to avoid duplicating block metadata.
-    BlockManager m_blockman GUARDED_BY(::cs_main);
+    node::BlockManager m_blockman;
 
     /**
      * In order to efficiently track invalidity of headers, we keep the set of
@@ -886,7 +904,7 @@ public:
     //! - Move the new chainstate to `m_snapshot_chainstate` and make it our
     //!   ChainstateActive().
     [[nodiscard]] bool ActivateSnapshot(
-        CAutoFile& coins_file, const SnapshotMetadata& metadata, bool in_memory);
+        CAutoFile& coins_file, const node::SnapshotMetadata& metadata, bool in_memory);
 
     //! The most-work chain.
     CChainState& ActiveChainstate() const;
@@ -894,7 +912,7 @@ public:
     int ActiveHeight() const { return ActiveChain().Height(); }
     CBlockIndex* ActiveTip() const { return ActiveChain().Tip(); }
 
-    BlockMap& BlockIndex() EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+    node::BlockMap& BlockIndex() EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
     {
         return m_blockman.m_block_index;
     }

@@ -88,8 +88,15 @@ static inline auto quoted(const std::string& s)
 // Allow safe path append operations.
 static inline path operator+(path p1, path p2)
 {
-    p1 += std::move(p2);
+    p1 += static_cast<boost::filesystem::path&&>(p2);
     return p1;
+}
+
+// Disallow implicit std::string conversion for copy_file
+// to avoid locale-dependent encoding on Windows.
+static inline void copy_file(const path& from, const path& to, copy_option options)
+{
+    boost::filesystem::copy_file(from, to, options);
 }
 
 /**
